@@ -2126,19 +2126,23 @@ const SYSTEM_PROMPT = `你是"说记"App的AI学习助手，专注于帮助用�
 
 【追问规则】
 - 每次只问一个问题，不超过100字（不包含纠错附注）
+- 追问必须直接输出纯文本问题，严禁使用任何JSON、代码块、括号或引号包装（例如严禁输出 {"action":"ask","question":"..."} 这类格式），也不要输出任何markdown符号
+- 提出下一轮追问前，必须先回顾并吸收前面所有轮次的完整对话（用户最初的描述、你之前的追问、用户每一轮的回答），新的追问要建立在此前讨论的基础上，只追问尚未弄清楚的关键点，不要重复已问过或用户已经回答清楚的内容
 - 如果用户说"跳过"或"生成卡片"，直接进入卡片生成
 - 追问不超过${MAX_QUESTIONS}轮，之后自动生成卡片
 
 【卡片生成规则】——生成卡片时必须严格遵守：
-1. 语言风格：优先保留用户自己的措辞、比喻和举例，不要改写成教科书式语言；用户说"就像..."就保留这个类比，用户用的口语就保留口语风格
-2. 结构化呈现：将整合后的内容按以下格式组织（根据实际内容灵活选用）：
-   【核心概念】用1-2句话提炼用户对这个知识点的核心理解（用用户自己的话）
-   【关键细节】列出2-4条用户提到的重要细节、机制或步骤
-   【举个例子】如果用户或追问中有具体例子，完整保留（这是最有价值的部分）
-   【容易混淆】如果追问中暴露了容易误解的地方，单独标注出来
-3. 整合追问：把用户在每轮追问中补充的所有信息都融入正文对应位置，不要遗漏
-4. 长度控制：正文不超过500字，精炼但完整
-5. 纠错内容不写入卡片正文——卡片只保留用户自己理解后的正确版本
+1. 提炼总结：你必须回顾并整合整个对话（用户最初的知识描述 + 你的各轮追问 + 用户回答的内容），用自己的话重新提炼组织成卡片。标题、标签、正文都必须是你的归纳总结，绝对禁止直接复制、拼接用户原话、聊天记录或追问文本来充当卡片内容；用户生动的比喻、例子可以化用，但要融入你自己的表达，行文自然、避免教科书腔
+2. 标题(title)：不超过10字，是你提炼出的核心概念概括，禁止截取用户的句子充当标题
+3. 标签(tag)：不超过10字的分类名
+4. 结构化呈现：将提炼后的内容按以下格式组织（根据实际内容灵活选用）：
+   【核心概念】用1-2句话概括这个知识点的核心理解
+   【关键细节】列出2-4条重要的机制、步骤或要点
+   【举个例子】具体例子（如果有则完整保留其要点，这是最有价值的部分）
+   【容易混淆】追问中暴露出的易错点（若有则单独标注）
+5. 正文一律使用纯文本（可用【】章节标签），禁止使用任何markdown符号（**、-、#、*等）
+6. 长度控制：正文不超过500字，精炼但完整
+7. 纠错内容不写入卡片正文——卡片只保留用户理解后的正确版本
 
 当你认为信息足够时，或已追问${MAX_QUESTIONS}轮，输出格式严格如下（必须是合法JSON，content字段内用\\n换行）：
 \`\`\`json
@@ -2193,19 +2197,73 @@ async function callAI(messages) {
   }
 }
 
+// ============================================================
+// AI回复解析：统一处理 卡片JSON / 追问JSON(action=ask) / 纯文本，
+// 并清理markdown代码块与JSON包装残留（{ "action":"ask","question":"..." } 只取 question）
+// ============================================================
+function parseAIReply(raw) {
+  let text = (raw || '').trim();
+  // 剥离整体被代码块包裹的内容（```json ... ```）
+  const wholeFence = text.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  if (wholeFence) text = wholeFence[1].trim();
+  // 完整JSON解析：卡片 / ask追问
+  try {
+    const obj = JSON.parse(text);
+    if (obj && typeof obj === 'object' && !Array.isArray(obj)) {
+      if (obj.action === 'generate_card') {
+        return { type: 'card', question: '', card: obj };
+      }
+      const q = [obj.question, obj.text, obj.content]
+        .find(v => typeof v === 'string' && v.trim());
+      if (q) return { type: 'ask', question: q.trim(), card: null };
+    }
+  } catch (e) { /* 非完整JSON，继续下方兜底处理 */ }
+  // 文本中内嵌JSON追问（如说明文字后贴了JSON），提取其中的 question 字段
+  const inner = text.match(/["']question["']\s*:\s*["']([\s\S]*?)["']\s*[},]/);
+  if (inner) return { type: 'ask', question: inner[1].replace(/\\n/g, '\n').trim(), card: null };
+  // 文本中夹带代码块（如先说明再贴JSON），剥出代码块内容后递归解析
+  const midFence = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+  if (midFence) return parseAIReply(midFence[1]);
+  // 最后防线：清除行首行尾残留的花括号 / "action":"ask","question": 前缀等包装
+  let plain = text;
+  if (/^\{/.test(plain)) {
+    plain = plain.replace(/^\{+/, '')
+      .replace(/"action"\s*:\s*"ask"\s*,\s*"question"\s*:\s*"/, '');
+  }
+  if (/\}$/.test(plain)) plain = plain.replace(/"?\s*\}+$/, '');
+  plain = plain.replace(/^[\s"'“]+|[\s"'”]+$/g, '').trim();
+  return { type: 'text', question: plain, card: null };
+}
+
+// 本地兜底卡片草稿：把用户多条描述按卡片结构整理（无AI时可编辑），而非聊天记录原样搬运
+function buildFallbackCard(rawUserText, category) {
+  const lines = (rawUserText || '').split('\n')
+    .map(l => l.replace(/\[.*?\]/g, '').trim())
+    .filter(Boolean);
+  const first = lines[0] || '';
+  const rest = lines.slice(1).join('\n').trim();
+  let content = '【核心概念】' + first;
+  if (rest) content += '\n\n【关键细节】' + rest;
+  return {
+    title: first.slice(0, 10) || '知识卡片',
+    tag: (category || '').slice(0, 10),
+    content: content.slice(0, 500)
+  };
+}
+
 function simulateAI(messages) {
-  // 模拟AI回复（无API Key时使用）
+  // 模拟AI回复（无API Key或接口失败时使用）
   const allUserMsgs = messages.filter(m => m.role === 'user' && !m.content.startsWith('[用户跳过'));
-  const firstUserText = allUserMsgs.length > 0 ? allUserMsgs[0].content : '';
-  const rawTexts = allUserMsgs.map(m => m.content.replace(/\[.*?\]/g, '').trim()).join(' ');
+  const rawTexts = allUserMsgs.map(m => m.content.replace(/\[.*?\]/g, '').trim()).filter(Boolean).join('\n');
   const lastUserMsg = messages.filter(m => m.role === 'user').pop()?.content || '';
-  // 用户请求直接生成卡片 → 立即生成
+  // 用户请求直接生成卡片 → 立即生成（本地按卡片结构整理草稿）
   if (questionCount >= MAX_QUESTIONS || lastUserMsg.includes('直接生成知识卡片')) {
+    const fb = buildFallbackCard(rawTexts, currentLearnCategory);
     const cardJson = JSON.stringify({
       action: 'generate_card',
-      title: firstUserText.replace(/\[.*?\]/g, '').slice(0, 10) || '知识卡片',
-      tag: currentLearnCategory || '未分类',
-      content: '【核心概念】' + rawTexts.slice(0, 400)
+      title: fb.title || '知识卡片',
+      tag: fb.tag || '未分类',
+      content: fb.content
     }, null, 2);
     return '```json\n' + cardJson + '\n```';
   }
@@ -2232,26 +2290,24 @@ async function processUserMessage(text) {
   try {
     const aiReply = await callAI(messages);
     hideTyping();
-    chatHistory.push({ role: 'assistant', content: aiReply });
-    // 检查是否是生成卡片的JSON
-    const jsonMatch = aiReply.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      try {
-        const cardData = JSON.parse(jsonMatch[1]);
-        if (cardData.action === 'generate_card') {
-          appendAIMsg('整合你的描述和追问，我为你生成了这张知识卡片：');
-          setTimeout(() => appendGeneratedCard(cardData), 300);
-          chatState = 'done';
-          return;
-        }
-      } catch (e) { /* 非JSON，当普通回复 */ }
+    // 统一解析AI回复：卡片JSON / 追问JSON(action=ask) / 纯文本，清理markdown与JSON包装残留
+    const parsed = parseAIReply(aiReply);
+    if (parsed.type === 'card') {
+      chatHistory.push({ role: 'assistant', content: aiReply });
+      appendAIMsg('整合你的描述和追问，我为你生成了这张知识卡片：');
+      setTimeout(() => appendGeneratedCard(parsed.card), 300);
+      chatState = 'done';
+      return;
     }
-    // 普通追问
+    // 追问：以纯文本形式【追加】进对话历史（必须追加而非替换——用户最初的描述
+    // 与每一轮回答都要完整保留，供后续追问回顾和最终卡片生成总结时使用）
+    const cleanQuestion = parsed.question;
+    chatHistory.push({ role: 'assistant', content: cleanQuestion });
     questionCount++;
     if (questionCount >= MAX_QUESTIONS) {
-      appendAIMsg(aiReply + '\n\n（已达到追问上限，你可以继续回答或点击右上方**生成卡片**按钮直接生成。）');
+      appendAIMsg(cleanQuestion + '\n\n（已达到追问上限，你可以继续回答或点击右上方**生成卡片**按钮直接生成。）');
     } else {
-      appendAIQuestionCard(aiReply);
+      appendAIQuestionCard(cleanQuestion);
     }
   } catch (e) {
     hideTyping();
@@ -2351,47 +2407,44 @@ async function forceGenerateCard() {
     { role: 'system', content: SYSTEM_PROMPT },
     ...chatHistory
   ];
+  let aiReply = '';
   try {
-    const aiReply = await callAI(messages);
-    hideTyping();
-    chatHistory.push({ role: 'assistant', content: aiReply });
-    // 检查是否是生成卡片的JSON
-    const jsonMatch = aiReply.match(/```json\s*([\s\S]*?)```/);
-    if (jsonMatch) {
-      try {
-        const cardData = JSON.parse(jsonMatch[1]);
-        if (cardData.action === 'generate_card') {
-          appendAIMsg('好的，为你整合信息直接生成知识卡片：');
-          setTimeout(() => appendGeneratedCard(cardData), 300);
-          chatState = 'done';
-          return;
-        }
-      } catch (e) { /* 非JSON回退 */ }
-    }
-    // 兜底：AI 没有返回卡片 JSON（如追问尚未到上限但 AI 仍返回追问）
-    if (questionCount < MAX_QUESTIONS) {
-      appendAIMsg(aiReply);
-      questionCount++;
-    } else {
-      // 已达上限，强制用原始文本生成
-      const fallbackCard = {
-        title: allUserText.replace(/\[.*?\]/g, '').slice(0, 10),
-        tag: currentLearnCategory || '',
-        content: allUserText.replace(/\[.*?\]/g, '').slice(0, 500)
-      };
-      appendGeneratedCard(fallbackCard);
-    }
+    aiReply = await callAI(messages);
   } catch (e) {
     hideTyping();
-    // AI 失败，用原始文本兜底
-    const fallbackCard = {
-      title: allUserText.replace(/\[.*?\]/g, '').slice(0, 10),
-      tag: currentLearnCategory || '',
-      content: allUserText.replace(/\[.*?\]/g, '').slice(0, 500)
-    };
-    appendAIMsg('AI 暂时不可用，使用原始内容为你生成卡片：');
+    // AI 失败：用本地整理的卡片草稿兜底（可编辑后保存）
+    const fallbackCard = buildFallbackCard(allUserText);
+    appendAIMsg('AI 暂时不可用，已根据你的描述整理卡片草稿，可编辑后保存：');
     setTimeout(() => appendGeneratedCard(fallbackCard), 300);
+    chatState = 'done';
+    return;
   }
+  hideTyping();
+  let parsed = parseAIReply(aiReply);
+  // AI 仍返回追问而非卡片 JSON 时，用强指令重试一次
+  if (parsed.type !== 'card') {
+    showTyping();
+    try {
+      const retryReply = await callAI(messages.concat({
+        role: 'user',
+        content: '[最后一次提醒：用户已明确点击"生成卡片"，请立即输出generate_card格式的JSON，绝对不要再追问]'
+      }));
+      hideTyping();
+      const retried = parseAIReply(retryReply);
+      if (retried.type === 'card') { parsed = retried; aiReply = retryReply; }
+    } catch (e2) { hideTyping(); }
+  }
+  if (parsed.type === 'card') {
+    chatHistory.push({ role: 'assistant', content: aiReply });
+    appendAIMsg('好的，为你整合信息直接生成知识卡片：');
+    setTimeout(() => appendGeneratedCard(parsed.card), 300);
+    chatState = 'done';
+    return;
+  }
+  // 最终兜底：AI 仍未输出卡片 JSON，用本地整理的草稿（可编辑）
+  const fallbackCard = buildFallbackCard(allUserText);
+  appendAIMsg('已根据你的全部描述整理出卡片草稿，可编辑后保存：');
+  setTimeout(() => appendGeneratedCard(fallbackCard), 300);
   chatState = 'done';
 }
 
@@ -2478,19 +2531,17 @@ async function processNextQuestion() {
   ];
   const reply = await callAI(messages);
   hideTyping();
-  const jsonMatch = reply.match(/```json\s*([\s\S]*?)```/);
-  if (jsonMatch) {
-    try {
-      const cardData = JSON.parse(jsonMatch[1]);
-      if (cardData.action === 'generate_card') {
-        appendAIMsg('好的，为你整合信息生成卡片：');
-        setTimeout(() => appendGeneratedCard(cardData), 300);
-        chatState = 'done';
-        return;
-      }
-    } catch(e) {}
+  const parsed = parseAIReply(reply);
+  if (parsed.type === 'card') {
+    chatHistory.push({ role: 'assistant', content: '已生成知识卡片' });
+    appendAIMsg('好的，为你整合信息生成卡片：');
+    setTimeout(() => appendGeneratedCard(parsed.card), 300);
+    chatState = 'done';
+    return;
   }
-  appendAIQuestionCard(reply);
+  // 追问：存纯文本历史，展示净化后的问题
+  chatHistory.push({ role: 'assistant', content: parsed.question });
+  appendAIQuestionCard(parsed.question);
   chatState = 'idle';
 }
 
