@@ -1075,7 +1075,7 @@ const AI_CONFIG = {
   enabled: true,           // true=真实API，false=模拟模式
   apiKey: 'sk-2b1ba57f89914e3090a2e9df1d4939fa',
   apiUrl: 'https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions',
-  model: 'qwen-plus',     // qwen-plus 性价比最优，追问+卡片生成表现稳定
+  model: 'qwen3.8-27b',   // qwen3.8-27b 新模型，追问+卡片生成表现稳定
 };
 
 // ============================================================
@@ -2166,7 +2166,8 @@ async function callAI(messages) {
         messages: messages,
         max_tokens: 1200,       // 卡片JSON+内容(500字)需要较大token空间
         temperature: 0.7,
-        top_p: 0.9
+        top_p: 0.9,
+        enable_thinking: false  // qwen3.8系列关闭思考模式，避免思考内容占用token和拖慢响应
       })
     });
     if (!response.ok) {
